@@ -32,14 +32,39 @@ function getChromeExecutablePath(): string {
   }
 }
 
-// Helper function to check if Chrome is accessible
-async function isChromeAccessible(): Promise<boolean> {
+// Helper function to check if Chrome is accessible and get target info
+async function isChromeAccessible(): Promise<{ accessible: boolean; targets?: any[] }> {
   try {
     const targets = await CDP.List({ port: 9222 });
-    return targets.length > 0;
+    return { accessible: targets.length > 0, targets };
   } catch (error) {
-    return false;
+    return { accessible: false };
   }
+}
+
+// Helper function to kill existing Chrome debug processes
+async function killChromeDebugProcesses(): Promise<void> {
+  try {
+    const { spawn } = await import("child_process");
+    await new Promise<void>((resolve) => {
+      const killProcess = spawn("pkill", ["-f", "remote-debugging-port=9222"]);
+      killProcess.on("close", () => {
+        setTimeout(resolve, 1000); // Wait for processes to fully terminate
+      });
+    });
+  } catch (error) {
+    // Ignore errors - process might not exist
+  }
+}
+
+// Helper function to wait for Chrome to be accessible with retries
+async function waitForChromeAccessible(maxRetries = 10, delayMs = 500): Promise<boolean> {
+  for (let i = 0; i < maxRetries; i++) {
+    const { accessible } = await isChromeAccessible();
+    if (accessible) return true;
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+  return false;
 }
 
 // Tool: Start Chrome in debug mode
@@ -59,17 +84,21 @@ server.tool(
   },
   async ({ userDataDir, headless }) => {
     try {
-      // Check if Chrome is already running
-      if (await isChromeAccessible()) {
+      // Check if Chrome is already running and working
+      const chromeStatus = await isChromeAccessible();
+      if (chromeStatus.accessible) {
         return {
           content: [
             {
               type: "text",
-              text: "Chrome debug instance is already running on port 9222",
+              text: `Chrome debug instance is already running on port 9222\nActive targets: ${chromeStatus.targets?.length || 0}`,
             },
           ],
         };
       }
+
+      // Kill any existing Chrome debug processes that might be stuck
+      await killChromeDebugProcesses();
 
       const chromePath = getChromeExecutablePath();
       const tempUserDataDir =
@@ -83,10 +112,12 @@ server.tool(
         "--disable-renderer-backgrounding",
         "--disable-features=TranslateUI",
         "--disable-ipc-flooding-protection",
+        "--no-first-run",
+        "--no-default-browser-check",
       ];
 
       if (headless) {
-        chromeArgs.push("--headless", "--disable-gpu");
+        chromeArgs.push("--headless=new", "--disable-gpu");
       }
 
       chromeProcess = spawn(chromePath, chromeArgs, {
@@ -94,22 +125,32 @@ server.tool(
         detached: false,
       });
 
-      // Wait a moment for Chrome to start
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // Handle process errors
+      chromeProcess.on("error", (error) => {
+        throw new Error(`Failed to start Chrome: ${error.message}`);
+      });
 
-      if (await isChromeAccessible()) {
-        const targets = await CDP.List({ port: 9222 });
+      // Wait for Chrome to be accessible with retries
+      const isAccessible = await waitForChromeAccessible(15, 500);
+      
+      if (isAccessible) {
+        const { targets } = await isChromeAccessible();
         return {
           content: [
             {
               type: "text",
-              text: `Chrome debug instance started successfully!\nPID: ${chromeProcess?.pid}\nDebugging port: 9222\nUser data directory: ${tempUserDataDir}\nActive targets: ${targets.length}`,
+              text: `Chrome debug instance started successfully!\nPID: ${chromeProcess?.pid}\nDebugging port: 9222\nUser data directory: ${tempUserDataDir}\nActive targets: ${targets?.length || 0}`,
             },
           ],
         };
       } else {
+        // Clean up failed process
+        if (chromeProcess) {
+          chromeProcess.kill();
+          chromeProcess = null;
+        }
         throw new Error(
-          "Chrome started but debugging interface is not accessible"
+          "Failed to start Chrome: Chrome started but debugging interface is not accessible after 7.5 seconds"
         );
       }
     } catch (error) {
@@ -149,7 +190,8 @@ server.tool(
   },
   async ({ urlFilter, method, statusCode, limit }) => {
     try {
-      if (!(await isChromeAccessible())) {
+      const chromeStatus = await isChromeAccessible();
+      if (!chromeStatus.accessible) {
         return {
           content: [
             {
@@ -328,7 +370,8 @@ server.tool(
   },
   async ({ requestId, includeHeaders }) => {
     try {
-      if (!(await isChromeAccessible())) {
+      const chromeStatus = await isChromeAccessible();
+      if (!chromeStatus.accessible) {
         return {
           content: [
             {
@@ -479,7 +522,8 @@ server.tool(
   },
   async ({ url }) => {
     try {
-      if (!(await isChromeAccessible())) {
+      const chromeStatus = await isChromeAccessible();
+      if (!chromeStatus.accessible) {
         return {
           content: [
             {
@@ -641,7 +685,8 @@ server.tool(
         const method = req.method || 'GET';
         const uri = req.url;
         const requestId = req.requestId;
-        return `  ${method} ${uri} [${requestId}]`;
+        const status = req.response?.status || 'pending';
+        return `  ${method} ${status} ${uri} [${requestId}]`;
       }).join('\n');
 
       return {
@@ -652,7 +697,6 @@ server.tool(
 
 Network Traffic Summary:
 - Total network requests: ${totalRequests}
-- API requests to ${targetDomain}: ${apiRequests.length}
 
 API Requests (same domain):
 ${apiRequestDetails || '  None'}
