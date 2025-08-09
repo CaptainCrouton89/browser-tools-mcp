@@ -549,8 +549,17 @@ server.tool(
         };
       }
 
-      // Initialize global CDP client if needed
-      if (!cdpClient) {
+      // Initialize global CDP client if needed or if connection is closed
+      if (!cdpClient || cdpClient._ws?.readyState !== 1) {
+        if (cdpClient) {
+          try {
+            await cdpClient.close();
+          } catch {
+            // Ignore close errors
+          }
+          cdpClient = null;
+        }
+        
         cdpClient = await CDP({ target: pageTarget.webSocketDebuggerUrl });
         await cdpClient.Page.enable();
         await cdpClient.Network.enable();
